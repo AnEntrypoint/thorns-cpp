@@ -1,0 +1,8 @@
+if(NOT EXISTS "${FILE}")
+  message(FATAL_ERROR "size gate: ${FILE} is missing")
+endif()
+file(SIZE "${FILE}" SIZE_BYTES)
+if(SIZE_BYTES GREATER MAX)
+  message(FATAL_ERROR "size gate: ${SIZE_BYTES} bytes exceeds ${MAX}")
+endif()
+message(STATUS "size gate: ${SIZE_BYTES} bytes within ${MAX}")
