@@ -79,16 +79,33 @@ comparison is for the feature set v0 actually covers, not for parity.
 4. Parity tests: run Node thorns' `verify-*.mjs` expectations against the C++ output for the shared sections.
 5. Packaging: static build per platform (mac/win/linux, x64 and arm), size gate in CI.
 
-## Known gaps in v0
+## Known gaps
 
-- C++ `using X = ...` and `use`/`using` lines produce spurious deps (`Clock`, `Box`, `Result`). Filter by grammar.
-- Python multi-line strings can leak into code view.
-- JS arrow functions and class methods are not counted as functions unless they have `name(...) {` form.
-- `.gitignore` globs are ignored (lines with `*`, `!` or inner `/` are skipped), so they do not filter.
-- Not a git repo; not committed or pushed.
+Fixed in this pass, with witnesses in `docs/PENDING_VALIDATION.md` and `tests/witness.sh`:
+
+- C++ `using X = ...` and `using` lines no longer produce spurious deps.
+- Python triple-quoted strings no longer leak imports, defs or env reads into the overview.
+- Env reads are counted once (`os.getenv(` no longer also matches `getenv(`).
+- JS arrow functions and class methods are counted (witness: 4 functions in the JS fixture).
+- `.gitignore` globs (`*`, `/anchored`) filter files (witness: `*.min.js` and `/dist` excluded).
+- The architecture tree is rooted at `main` and every `package.json` `bin` target, and shows each module's exports.
+
+Open (see `tests/parity.sh`, which fails on these by design):
+
+- No Markdown section layout (`## Architecture`, `## Issues`, `## Dead code`, `## I/O`, `## Calls`, `## Dependencies`), no `legend:` line, no `orphans:` or `unused deps:` lines, no call graph, no I/O storage detection.
+- Python `from pkg.mod import x` against a local package is counted as an external dep (`src`).
+- Git: the repo is initialised locally (baseline commit by lanmower). There is no remote, so nothing is pushed.
 
 ## Build
 
-    cmake -S /config/workspace/thorns-cpp -B /config/workspace/thorns-cpp/build
+    cmake -S /config/workspace/thorns-cpp -B /config/workspace/thorns-cpp/build -DDEOXIDENE_DIR=/config/workspace/deoxidene
     cmake --build /config/workspace/thorns-cpp/build -j
     /config/workspace/thorns-cpp/build/thorns /path/to/project --budget 2000
+
+The release binary is statically linked (`-DTHORNS_STATIC=OFF` for a dynamic build). A size gate
+(`THORNS_MAX_BYTES`, default 2 MiB) runs on every build and fails the build when the binary is larger.
+
+## Tests
+
+    tests/witness.sh   # behaviour witnesses, expected 12 pass
+    tests/parity.sh    # Node verify-overview parity, shared sections; FAIL lines are open gaps
