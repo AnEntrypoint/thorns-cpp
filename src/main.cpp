@@ -98,6 +98,7 @@ struct Totals {
 
 struct Project {
     std::string name, version, description, main;
+    std::vector<std::string> bins;
 };
 
 bool isIdentChar(char c) {
@@ -165,6 +166,15 @@ std::string codeView(std::string_view src, Style style) {
         if (c == '\n') {
             out[i] = '\n';
             ++i;
+            continue;
+        }
+        if (style == Style::Python && (c == '"' || c == '\'') && i + 2 < n && src[i + 1] == c && src[i + 2] == c) {
+            i += 3;
+            while (i < n && !(src[i] == c && i + 2 < n && src[i + 1] == c && src[i + 2] == c)) {
+                if (src[i] == '\n') out[i] = '\n';
+                ++i;
+            }
+            i = std::min(n, i + 3);
             continue;
         }
         if (slashComments && c == '/' && i + 1 < n && src[i + 1] == '/') {
@@ -444,6 +454,7 @@ void scanEnv(std::string_view src, FileReport& r) {
     };
     for (const auto& m : kMarkers) {
         for (std::size_t p = src.find(m.text); p != npos; p = src.find(m.text, p + m.text.size())) {
+            if (p > 0 && (isIdentChar(src[p - 1]) || src[p - 1] == '.')) continue;
             std::size_t q = p + m.text.size();
             std::string name;
             if (m.quoted) {
@@ -583,6 +594,25 @@ bool isBuiltin(std::string_view name) {
     return name.starts_with("node:") || names.contains(name);
 }
 
+std::string blankPyTripleQuoted(std::string_view src) {
+    std::string out(src);
+    const std::size_t n = src.size();
+    for (std::size_t i = 0; i + 2 < n;) {
+        const char c = src[i];
+        if ((c == '"' || c == '\'') && src[i + 1] == c && src[i + 2] == c) {
+            std::size_t j = i + 3;
+            while (j < n && !(src[j] == c && j + 2 < n && src[j + 1] == c && src[j + 2] == c)) {
+                if (src[j] != '\n') out[j] = ' ';
+                ++j;
+            }
+            i = j + 3;
+            continue;
+        }
+        ++i;
+    }
+    return out;
+}
+
 FileReport analyzeFile(const fs::path& root, const fs::path& path, LangInfo info, const std::string& src) {
     FileReport r;
     std::error_code ec;
@@ -590,15 +620,16 @@ FileReport analyzeFile(const fs::path& root, const fs::path& path, LangInfo info
     r.lang = info.name;
     r.lines = static_cast<std::size_t>(std::count(src.begin(), src.end(), '\n')) + (!src.empty() && src.back() != '\n' ? 1 : 0);
     const std::string code = codeView(src, info.style);
+    const std::string text = info.style == Style::Python ? blankPyTripleQuoted(src) : src;
     countTokens(code, r);
     if (info.style == Style::Brace) countBoundFunctions(code, r);
     if (info.style == Style::Brace) scanBraces(code, r);
     else if (info.style == Style::Python) scanPython(code, r);
-    scanImports(src, r);
-    scanNames(src, r);
+    scanImports(text, r);
+    scanNames(text, r);
     std::erase_if(r.exportedNames, [&](const std::string& n) { return countWord(code, n) > 1; });
-    scanEnv(src, r);
-    scanUrls(src, r);
+    scanEnv(text, r);
+    scanUrls(text, r);
     return r;
 }
 
@@ -773,6 +804,41 @@ std::string jsonField(const std::string& text, std::string_view key) {
     return out;
 }
 
+std::string jsonStringAt(const std::string& text, std::size_t q, std::size_t& end) {
+    end = text.find('"', q + 1);
+    if (end == std::string::npos) return {};
+    return text.substr(q + 1, end - q - 1);
+}
+
+std::vector<std::string> jsonBinTargets(const std::string& text) {
+    std::vector<std::string> out;
+    const std::size_t k = text.find("\"bin\"");
+    if (k == std::string::npos) return out;
+    std::size_t p = text.find(':', k);
+    if (p == std::string::npos) return out;
+    p = skipSpaces(text, p + 1);
+    if (p >= text.size()) return out;
+    std::size_t end = 0;
+    if (text[p] == '"') {
+        out.push_back(jsonStringAt(text, p, end));
+        return out;
+    }
+    if (text[p] != '{') return out;
+    const std::size_t close = text.find('}', p);
+    std::size_t valueIndex = 0;
+    for (std::size_t q = p + 1; q < close;) {
+        if (text[q] != '"') {
+            ++q;
+            continue;
+        }
+        const std::string s = jsonStringAt(text, q, end);
+        if (valueIndex % 2 == 1) out.push_back(s);
+        ++valueIndex;
+        q = end + 1;
+    }
+    return out;
+}
+
 Project readProject(const fs::path& root) {
     Project p;
     std::ifstream in(root / "package.json");
@@ -782,6 +848,7 @@ Project readProject(const fs::path& root) {
     p.version = jsonField(text, "version");
     p.description = jsonField(text, "description");
     p.main = jsonField(text, "main");
+    p.bins = jsonBinTargets(text);
     return p;
 }
 
@@ -974,25 +1041,34 @@ std::string joinCounted(const std::map<std::string, std::size_t>& m, std::size_t
 
 void appendTree(const std::string& rel, const std::map<std::string, const FileReport*>& byRel, std::size_t depth,
                 std::set<std::string>& seen, std::string& out) {
-    out += std::string(depth * 2, ' ') + rel;
+    const auto it = byRel.find(rel);
+    std::string label = rel;
+    if (it != byRel.end() && !it->second->exportedNames.empty()) {
+        label += "(";
+        for (std::size_t k = 0; k < it->second->exportedNames.size(); ++k) {
+            label += (k ? ", " : "") + it->second->exportedNames[k];
+        }
+        label += ")";
+    }
+    out += std::string(depth * 2, ' ') + label;
     if (seen.contains(rel)) {
         out += " (seen)\n";
         return;
     }
     out += "\n";
     seen.insert(rel);
-    const auto it = byRel.find(rel);
     if (depth >= 6 || it == byRel.end()) return;
     for (const auto& target : it->second->targets) appendTree(target, byRel, depth + 1, seen, out);
 }
 
-std::string archTree(const Totals& t, const std::string& entry) {
+std::string archTree(const Totals& t, const std::vector<std::string>& entries) {
     std::map<std::string, const FileReport*> byRel;
     for (const auto& r : t.reports) byRel.emplace(r.rel, &r);
     std::vector<std::string> starts;
-    if (byRel.contains(entry)) {
-        starts.push_back(entry);
-    } else {
+    for (const auto& entry : entries) {
+        if (byRel.contains(entry)) starts.push_back(entry);
+    }
+    if (starts.empty()) {
         for (const auto& r : t.reports) {
             if (starts.size() >= 3) break;
             if (r.lang != "json" && !t.inDegree.contains(r.rel)) starts.push_back(r.rel);
@@ -1063,11 +1139,15 @@ std::string render(const Totals& t, const Project& p, const std::string& root, s
 
     add("functions", "functions: " + std::to_string(t.functions));
 
-    std::string entry = p.main;
-    if (entry.starts_with("./")) entry.erase(0, 2);
+    std::vector<std::string> entries;
+    if (!p.main.empty()) entries.push_back(p.main);
+    entries.insert(entries.end(), p.bins.begin(), p.bins.end());
+    for (auto& e : entries) {
+        if (e.starts_with("./")) e.erase(0, 2);
+    }
     std::vector<std::string> unimported;
     for (const auto& r : t.reports) {
-        if (r.lang == "json" || r.rel == entry || t.inDegree.contains(r.rel)) continue;
+        if (r.lang == "json" || std::find(entries.begin(), entries.end(), r.rel) != entries.end() || t.inDegree.contains(r.rel)) continue;
         unimported.push_back(r.rel);
     }
     add("graph", "graph: edges=" + std::to_string(t.edges) + " unresolved=" + std::to_string(t.unresolved) +
@@ -1077,7 +1157,7 @@ std::string render(const Totals& t, const Project& p, const std::string& root, s
         for (std::size_t k = 0; k < t.cycles[i].size() && k < 6; ++k) line += " " + t.cycles[i][k];
         add("cycles", line);
     }
-    const std::string arch = archTree(t, entry);
+    const std::string arch = archTree(t, entries);
     add("arch", arch.empty() ? "" : "arch:\n" + arch);
     if (!unimported.empty()) {
         std::string line = "unimported:";
@@ -1122,6 +1202,7 @@ std::string render(const Totals& t, const Project& p, const std::string& root, s
     }
     std::vector<std::string> unusedLines;
     for (const auto& r : t.reports) {
+        if (std::find(entries.begin(), entries.end(), r.rel) != entries.end()) continue;
         std::string names;
         for (const auto& n : r.exportedNames) {
             if (t.allImported.contains(n)) continue;
