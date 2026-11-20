@@ -24,6 +24,9 @@ check "Python triple-quoted text does not leak imports" bash -c '! grep -q fake_
 check "Python triple-quoted text does not leak defs (2 fn)" grep -q "^functions: 2$" <<<"$py"
 check "env var counted once per occurrence" grep -qx "env: HOME×1" <<<"$py"
 check "JS arrow and class method and function counted (4 fn)" grep -q "^functions: 4$" <<<"$js"
+pkg="$("$bin" "$here/fixtures/pkg")"
+check "Python absolute import resolves to a local module" bash -c 'grep -q "graph: edges=1 " <<<"$1" && ! grep -q "external: .*pkg" <<<"$1"' _ "$pkg"
+check "Python calls edge execute → helper" grep -q "execute → helper" <<<"$ov"
 check "binary is statically linked" bash -c 'file "$1" | grep -q "statically linked"' _ "$bin"
 echo "RESULT pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]
