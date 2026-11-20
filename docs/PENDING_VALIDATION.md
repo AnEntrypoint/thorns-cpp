@@ -1,37 +1,37 @@
 # Pending validation
 
-Owner: lanmower. Remote: none. The Phase B push is blocked on an owner-provided remote; nothing has been pushed and no remote has been created.
+Owner: lanmower. Remote: none. Push is blocked on an owner-provided remote; nothing has been pushed and no remote was created.
 
 ## Phase A changes (each committed as lanmower)
 
 | Commit | Change | Witness |
 |---|---|---|
-| 9ca0bfb | Baseline: git init on main, .gitignore for build/ and runs/ | git log shows the baseline |
-| c9aa669 | Python triple-quoted text blanked before import, name and URL scans; getenv marker no longer matches inside os.getenv; architecture tree rooted at main and bin targets with exports; entry exports not listed as unused | tests/witness.sh 12/12 at that commit |
-| be0db38 | Static link (THORNS_STATIC, default ON); size_gate target against THORNS_MAX_BYTES (default 2 MiB) | build prints "size gate: 1682312 bytes within 2097152" |
-| 03fc247 | tests/witness.sh, tests/parity.sh, tests/fixtures | witness and parity output |
-| a1b2fea | PLAN.md known gaps and build sections, this file | n/a |
-| (next) | Markdown sections (Architecture, Issues, Dead code, Dependencies, I/O, Calls, Metrics), stats line, header with (cli, ESM), orphans, unused deps, external counts with ×N, storage sql, call graph by name, legend, default ignore list (drop bin, add .config, tests/fixtures, *.min.js, /embeddings), skip nested git repos and Python venvs | tests/witness.sh 12/12; tests/parity.sh 14/14; tests/ignore_witness.sh 13 files |
-| (next) | .playwriter/ added to .gitignore | git check-ignore |
+| 9ca0bfb | Baseline: git init, .gitignore for build/ and runs/ | git log |
+| c9aa669 | Python triple-quote blanking, getenv dedupe, architecture tree rooted at main and bin with exports | witness 12/12 at that commit |
+| be0db38 | Static link (THORNS_STATIC) and size_gate target | build prints size gate line |
+| 03fc247 | tests/witness.sh, tests/parity.sh, fixtures | script output |
+| a1b2fea | PLAN.md known gaps and build sections | n/a |
+| 9 commits after a1b2fea | Markdown sections, call graph, storage sql, default ignore list, nested repo and venv skip | witness, ignore witness, parity 14/14 |
+| be6f1cd, 7d61534, 82d1a18 | Ignore witness and fixtures; .playwriter/ ignored; PENDING doc | ignore witness 13 files |
+| (this pass, grouped) | Remove deoxidene dependency (deoxidene is not present on this machine; local parsePositive replaces parse_positive_int); --budget counts characters with section-heading and dropped-line accounting; Python calls (function spans for def bodies); Python absolute imports resolve to local modules, unresolved ones count as external | witness 14/14, parity 18/18, ignore witness 13 files |
+| (this pass) | tests/fixtures/pkg, Python witnesses, parity checks for budget, verify-setup analyze, Python calls | same |
 
 ## Phase B validation
 
 | Step | Wall time | Result |
 |---|---|---|
-| Clean configure and build, static, with size gate | 7616 ms | -- size gate: 1686408 bytes within 2097152 |
-| tests/witness.sh, tests/ignore_witness.sh, tests/parity.sh | 142 ms | RESULT pass=12 fail=0
+| Clean configure and build, static, with size gate | 7288 ms (measured as 7288 ms in the run) | -- size gate: 1686408 bytes within 2097152 |
+| witness, ignore witness, parity, file | 195 ms | RESULT pass=14 fail=0
 RESULT pass=1 fail=0
-RESULT pass=14 fail=0 (fail = open parity gaps) |
+RESULT pass=18 fail=0 (fail = open parity gaps)
+build/thorns: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, Buil |
 
-Defects found and fixed in Phase B: the Python triple-quote leak also reached import scanning (fixed by blanking before scans); the default ignore list dropped source directories named bin, which the Node verify-ignore expectations keep (removed); nested git repos and venvs were walked (now skipped); the header and the counts in witness/ignore fixtures were updated to the new layout.
+Defects found and fixed in Phase B: deoxidene was missing from the machine, so the build failed on its include; the dependency was removed (one function used). The default ignore list dropped bin, which the Node expectations keep. Nested git repos and venvs were walked; now skipped. The budget was measured in bytes instead of characters, and the dropped-section line was unbounded; fixed.
 
 ## Open
 
-- Python calls: `execute → helper` is not extracted (call graph covers brace-language functions only).
-- Python local package import: `from src.helpers import x` is counted as external `src`.
-- `--budget`: Node's verify expects a character budget (budget 400 gives at most 400 characters); this build treats the budget as tokens (×4 characters). Not changed.
-- verify-setup.mjs has not been mapped to a C++ check.
+- Node verify-setup.mjs: only the "analyze current directory" check is applicable to the C++ binary (covered). Its other checks test the Node repo's own files (bun config, shell scripts, executable bit) and are not C++ behaviour.
 - Mac, Windows and arm builds are not produced here. No CI config exists.
 - Push: blocked on an owner-provided remote.
 
-REPORT: open — push blocked on owner-provided remote; Python call graph, budget semantics, verify-setup parity open — witness: tests/witness.sh RESULT pass=12 fail=0; tests/ignore_witness.sh RESULT pass=1 fail=0; tests/parity.sh RESULT pass=14 fail=0
+REPORT: open — push blocked on an owner-provided remote; cross-platform builds not produced — witness: tests/witness.sh RESULT pass=14 fail=0; tests/ignore_witness.sh RESULT pass=1 fail=0; tests/parity.sh RESULT pass=18 fail=0
