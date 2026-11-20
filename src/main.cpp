@@ -1,5 +1,3 @@
-#include <deoxidene/parse.hpp>
-
 #include <algorithm>
 #include <cctype>
 #include <cstddef>
@@ -10,6 +8,8 @@
 #include <iostream>
 #include <iterator>
 #include <map>
+#include <limits>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
@@ -17,7 +17,6 @@
 #include <vector>
 
 namespace fs = std::filesystem;
-namespace dx = deoxidene;
 
 namespace {
 
@@ -388,7 +387,12 @@ void scanPython(std::string_view code, FileReport& r) {
         }
         std::size_t end = j;
         while (end > i + 1 && lines[end - 1].find_first_not_of(' ') == npos) --end;
-        recordFn(r, i + 1, std::string(body.substr(d, paren - d)), end - i);
+        std::string name(body.substr(d, paren - d));
+        const std::size_t from = static_cast<std::size_t>(lines[i].data() - code.data());
+        const std::string_view last = lines[end - 1];
+        const std::size_t to = static_cast<std::size_t>(last.data() + last.size() - code.data()) - 1;
+        r.spans.push_back(FileReport::Span{name, from, to});
+        recordFn(r, i + 1, std::move(name), end - i);
     }
 }
 
@@ -420,7 +424,7 @@ void addImport(FileReport& r, std::string_view mod) {
 
 void addPython(FileReport& r, std::string_view mod) {
     if (!mod.empty() && mod[0] == '.') r.localSpecs.emplace_back(mod);
-    else addImport(r, firstSegment(mod));
+    else if (!mod.empty()) r.localSpecs.push_back("abs:" + std::string(mod));
 }
 
 void scanImports(std::string_view src, FileReport& r) {
@@ -914,6 +918,11 @@ std::string resolveOne(const FileReport& r, std::string_view spec, const fs::pat
             cands.push_back(stripped + ".tsx");
         }
         for (const char* idx : {"/index.js", "/index.ts", "/index.tsx", "/index.mjs"}) cands.push_back(base + idx);
+    } else if (lang == "python" && spec.starts_with("abs:")) {
+        std::string modPath;
+        for (const char ch : spec.substr(4)) modPath.push_back(ch == '.' ? '/' : ch);
+        cands.push_back(modPath + ".py");
+        cands.push_back(modPath + "/__init__.py");
     } else if (lang == "python") {
         const std::size_t dots = spec.find_first_not_of('.');
         const std::size_t levels = dots == npos ? spec.size() : dots;
@@ -967,7 +976,9 @@ void buildGraph(Totals& t, const fs::path& root) {
         std::set<std::string> targets;
         for (const auto& spec : r.localSpecs) {
             const std::string hit = resolveOne(r, spec, root, known);
-            if (hit.empty()) {
+            if (hit.empty() && spec.starts_with("abs:")) {
+                ++t.imports[std::string(firstSegment(spec.substr(4)))];
+            } else if (hit.empty()) {
                 ++t.unresolved;
                 if (t.unresolvedSample.size() < 8) t.unresolvedSample.push_back(r.rel + " -> " + spec);
             } else {
@@ -1125,6 +1136,12 @@ std::string archTree(const Totals& t, const std::vector<std::string>& entries) {
     return out;
 }
 
+constexpr std::string_view kLegend = "legend: ## section, ×N occurrences, (n) lines or complexity\n";
+
+std::size_t droppedSize(const std::vector<std::string>& dropped) {
+    return dropped.empty() ? 0 : 32;
+}
+
 enum Sec : std::size_t { kArch, kIssues, kDead, kDeps, kIo, kCalls, kMetrics, kSecCount };
 
 std::string render(const Totals& t, const Project& p, const std::string& root, std::size_t budgetChars) {
@@ -1134,11 +1151,13 @@ std::string render(const Totals& t, const Project& p, const std::string& root, s
     std::size_t used = 0;
     const auto add = [&](Sec s, const char* name, std::string text) {
         if (text.empty()) return;
-        if (budgetChars != 0 && used + text.size() + 1 > budgetChars) {
+        const std::size_t heading = sections[s].empty() ? kTitles[s].size() + 4 : 0;
+        const std::size_t cost = text.size() + 1 + heading;
+        if (budgetChars != 0 && used + cost + droppedSize(dropped) + 24 > budgetChars) {
             dropped.emplace_back(name);
             return;
         }
-        used += text.size() + 1;
+        used += cost;
         sections[s].push_back(std::move(text));
     };
 
@@ -1166,6 +1185,7 @@ std::string render(const Totals& t, const Project& p, const std::string& root, s
                               std::to_string(t.functions) + " fn · JS " + std::to_string(share({"javascript", "typescript"})) +
                               "% · Py " + std::to_string(share({"python"})) + "%";
 
+    used = head.size() + stats.size() + kLegend.size() + 2;
     std::vector<std::string> entries;
     if (!p.main.empty()) entries.push_back(p.main);
     entries.insert(entries.end(), p.bins.begin(), p.bins.end());
@@ -1309,19 +1329,30 @@ std::string render(const Totals& t, const Project& p, const std::string& root, s
         for (const auto& line : sections[s]) out += line + "\n";
     }
     if (!dropped.empty()) {
-        out += "dropped (budget):";
-        for (const auto& d : dropped) out += " " + d;
-        out += "\n";
+        out += "dropped (budget): " + std::to_string(dropped.size()) + " sections\n";
     }
-    out += "legend: ## = section, ×N = occurrences, (n) = lines, complexity or length\n";
+    out += kLegend;
     return out;
 }
 
 }
 
+std::optional<std::size_t> parsePositive(std::string_view s) {
+    if (s.empty()) return std::nullopt;
+    std::size_t v = 0;
+    for (const char c : s) {
+        if (c < '0' || c > '9') return std::nullopt;
+        const auto digit = static_cast<std::size_t>(c - '0');
+        if (v > (std::numeric_limits<std::size_t>::max() - digit) / 10) return std::nullopt;
+        v = v * 10 + digit;
+    }
+    if (v == 0) return std::nullopt;
+    return v;
+}
+
 int main(int argc, char** argv) {
     std::string target = ".";
-    std::size_t budgetTokens = 0;
+    std::size_t budgetChars = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--budget") {
@@ -1329,14 +1360,14 @@ int main(int argc, char** argv) {
                 std::cerr << "thorns: --budget needs a value\n";
                 return 2;
             }
-            const auto parsed = dx::parse_positive_int(argv[++i]);
+            const auto parsed = parsePositive(argv[++i]);
             if (!parsed) {
-                std::cerr << "thorns: --budget must be a positive integer\n";
+                std::cerr << "thorns: --budget must be a positive integer (characters)\n";
                 return 2;
             }
-            budgetTokens = static_cast<std::size_t>(*parsed);
+            budgetChars = static_cast<std::size_t>(*parsed);
         } else if (arg == "-h" || arg == "--help") {
-            std::cout << "usage: thorns [path] [--budget tokens]\n";
+            std::cout << "usage: thorns [path] [--budget chars]\n";
             return 0;
         } else {
             target = arg;
@@ -1353,6 +1384,6 @@ int main(int argc, char** argv) {
     buildCalls(totals);
     findCycles(totals);
     const Project project = readProject(root);
-    std::cout << render(totals, project, root.string(), budgetTokens * 4);
+    std::cout << render(totals, project, root.string(), budgetChars);
     return 0;
 }

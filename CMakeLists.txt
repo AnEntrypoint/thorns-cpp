@@ -8,12 +8,10 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-set(DEOXIDENE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../deoxidene" CACHE PATH "deoxidene checkout")
 option(THORNS_STATIC "Link the runtime statically" ON)
 set(THORNS_MAX_BYTES 2097152 CACHE STRING "Size gate for the release binary, in bytes")
 
 add_executable(thorns src/main.cpp)
-target_include_directories(thorns PRIVATE "${DEOXIDENE_DIR}/include")
 target_compile_options(thorns PRIVATE -Wall -Wextra -Wpedantic)
 
 target_compile_options(thorns PRIVATE $<$<CONFIG:Release>:-Os -ffunction-sections -fdata-sections -flto>)
