@@ -51,6 +51,13 @@ struct FileReport {
     std::size_t branches = 0;
     std::vector<std::string> exportedNames, importedNames;
     std::vector<std::pair<std::string, std::size_t>> shapes;
+    struct Span {
+        std::string name;
+        std::size_t from = 0, to = 0;
+    };
+    std::vector<Span> spans;
+    std::string code;
+    std::size_t sql = 0;
 };
 
 struct LangTally {
@@ -70,6 +77,8 @@ struct Totals {
     std::vector<std::vector<std::string>> cycles;
     std::size_t branches = 0;
     std::set<std::string> allImported;
+    std::set<std::string> calls;
+    std::size_t sql = 0;
 
     void add(FileReport&& r, std::size_t fileBytes) {
         ++files;
@@ -91,6 +100,7 @@ struct Totals {
         thenCatch += r.thenCatch;
         exports += r.exports;
         branches += r.branches;
+        sql += r.sql;
         for (const auto& n : r.importedNames) allImported.insert(n);
         reports.push_back(std::move(r));
     }
@@ -98,7 +108,8 @@ struct Totals {
 
 struct Project {
     std::string name, version, description, main;
-    std::vector<std::string> bins;
+    std::vector<std::string> bins, deps;
+    bool esm = false;
 };
 
 bool isIdentChar(char c) {
@@ -351,6 +362,7 @@ void scanBraces(std::string_view code, FileReport& r) {
                     const std::string shape = normalizeShape(code.substr(o.head, i - o.head + 1));
                     r.shapes.emplace_back(o.name, std::hash<std::string>{}(shape));
                 }
+                if (o.head != npos) r.spans.push_back(FileReport::Span{o.name, o.head, i});
                 recordFn(r, o.line, std::move(o.name), length);
             }
         }
@@ -630,6 +642,8 @@ FileReport analyzeFile(const fs::path& root, const fs::path& path, LangInfo info
     std::erase_if(r.exportedNames, [&](const std::string& n) { return countWord(code, n) > 1; });
     scanEnv(text, r);
     scanUrls(text, r);
+    r.code = code;
+    r.sql = countSub(text, "SELECT ") + countSub(text, "INSERT INTO ") + countSub(text, "DELETE FROM ");
     return r;
 }
 
@@ -743,6 +757,8 @@ bool isIgnored(const std::vector<IgnoreRule>& rules, const std::string& rel, boo
 }
 
 void walkDir(const fs::path& root, const fs::path& dir, const std::vector<IgnoreRule>& inherited, Totals& totals) {
+    std::error_code marker;
+    if (dir != root && (fs::exists(dir / ".git", marker) || fs::exists(dir / "pyvenv.cfg", marker))) return;
     std::vector<IgnoreRule> rules = inherited;
     const std::string baseRel = dir == root ? std::string() : relTo(dir, root);
     loadRules(dir / ".gitignore", baseRel, rules);
@@ -775,7 +791,8 @@ void walkDir(const fs::path& root, const fs::path& dir, const std::vector<Ignore
 Totals walk(const fs::path& root) {
     static const std::vector<std::string> kDefaultIgnores = {
         ".git", ".svn", ".hg", "node_modules", "dist", "build", "out", "target", ".next", ".nuxt", "__pycache__",
-        ".venv", "venv", "vendor", ".cache", "coverage", ".gm", ".idea", ".vscode", "obj", "bin",
+        ".venv", "venv", "vendor", ".cache", "coverage", ".gm", ".idea", ".vscode", "obj", ".config",
+        "tests/fixtures", "*.min.js", "/embeddings",
     };
     std::vector<IgnoreRule> rules;
     for (const auto& name : kDefaultIgnores) {
@@ -810,9 +827,9 @@ std::string jsonStringAt(const std::string& text, std::size_t q, std::size_t& en
     return text.substr(q + 1, end - q - 1);
 }
 
-std::vector<std::string> jsonBinTargets(const std::string& text) {
+std::vector<std::string> jsonObjectValues(const std::string& text, std::string_view key, bool keys) {
     std::vector<std::string> out;
-    const std::size_t k = text.find("\"bin\"");
+    const std::size_t k = text.find("\"" + std::string(key) + "\"");
     if (k == std::string::npos) return out;
     std::size_t p = text.find(':', k);
     if (p == std::string::npos) return out;
@@ -825,15 +842,15 @@ std::vector<std::string> jsonBinTargets(const std::string& text) {
     }
     if (text[p] != '{') return out;
     const std::size_t close = text.find('}', p);
-    std::size_t valueIndex = 0;
+    std::size_t index = 0;
     for (std::size_t q = p + 1; q < close;) {
         if (text[q] != '"') {
             ++q;
             continue;
         }
         const std::string s = jsonStringAt(text, q, end);
-        if (valueIndex % 2 == 1) out.push_back(s);
-        ++valueIndex;
+        if ((index % 2 == 0) == keys) out.push_back(s);
+        ++index;
         q = end + 1;
     }
     return out;
@@ -848,7 +865,9 @@ Project readProject(const fs::path& root) {
     p.version = jsonField(text, "version");
     p.description = jsonField(text, "description");
     p.main = jsonField(text, "main");
-    p.bins = jsonBinTargets(text);
+    p.bins = jsonObjectValues(text, "bin", false);
+    p.deps = jsonObjectValues(text, "dependencies", true);
+    p.esm = jsonField(text, "type") == "module";
     return p;
 }
 
@@ -995,6 +1014,31 @@ void strongConnect(std::size_t v, const std::vector<std::vector<std::size_t>>& a
     if (component.size() > 1 || selfLoop) s.components.push_back(std::move(component));
 }
 
+void buildCalls(Totals& t) {
+    std::set<std::string> defined;
+    for (const auto& r : t.reports) {
+        for (const auto& sp : r.spans) defined.insert(sp.name);
+    }
+    for (const auto& r : t.reports) {
+        for (const auto& sp : r.spans) {
+            const std::string_view body = std::string_view(r.code).substr(sp.from, sp.to - sp.from + 1);
+            for (std::size_t i = 0; i < body.size();) {
+                if (!isIdentChar(body[i]) || std::isdigit(static_cast<unsigned char>(body[i])) != 0) {
+                    ++i;
+                    continue;
+                }
+                const std::size_t s0 = i;
+                while (i < body.size() && isIdentChar(body[i])) ++i;
+                const std::string name(body.substr(s0, i - s0));
+                const std::size_t after = skipSpaces(body, i);
+                if (after < body.size() && body[after] == '(' && name != sp.name && defined.contains(name)) {
+                    t.calls.insert(sp.name + " → " + name);
+                }
+            }
+        }
+    }
+}
+
 void findCycles(Totals& t) {
     std::map<std::string, std::size_t> indexOf;
     std::vector<std::string> names;
@@ -1033,7 +1077,7 @@ std::string joinCounted(const std::map<std::string, std::size_t>& m, std::size_t
     for (std::size_t i = 0; i < v.size() && i < limit; ++i) {
         if (i) out += ", ";
         out += v[i].first;
-        if (v[i].second > 1) out += "x" + std::to_string(v[i].second);
+        out += "×" + std::to_string(v[i].second);
     }
     if (v.size() > limit) out += " +" + std::to_string(v.size() - limit);
     return out;
@@ -1081,63 +1125,46 @@ std::string archTree(const Totals& t, const std::vector<std::string>& entries) {
     return out;
 }
 
+enum Sec : std::size_t { kArch, kIssues, kDead, kDeps, kIo, kCalls, kMetrics, kSecCount };
+
 std::string render(const Totals& t, const Project& p, const std::string& root, std::size_t budgetChars) {
-    std::vector<std::string> sections;
+    static constexpr std::string_view kTitles[kSecCount] = {"Architecture", "Issues", "Dead code", "Dependencies", "I/O", "Calls", "Metrics"};
+    std::vector<std::string> sections[kSecCount];
     std::vector<std::string> dropped;
     std::size_t used = 0;
-    const auto add = [&](const char* name, std::string text) {
+    const auto add = [&](Sec s, const char* name, std::string text) {
         if (text.empty()) return;
         if (budgetChars != 0 && used + text.size() + 1 > budgetChars) {
             dropped.emplace_back(name);
             return;
         }
         used += text.size() + 1;
-        sections.push_back(std::move(text));
+        sections[s].push_back(std::move(text));
     };
 
-    add("header", "thorns-cpp 0.1 " + root + " files=" + std::to_string(t.files) + " lines=" + std::to_string(t.lines) +
-                      " bytes=" + std::to_string(t.bytes) + " skipped=" + std::to_string(t.skipped));
-    if (!p.name.empty()) {
-        add("project", "project: " + p.name + (p.version.empty() ? "" : "@" + p.version) + (p.description.empty() ? "" : " - " + p.description));
+    std::string head = "# " + (p.name.empty() ? fs::path(root).filename().string() : p.name);
+    if (!p.version.empty()) head += " " + p.version;
+    std::vector<std::string> tags;
+    if (!p.bins.empty()) tags.emplace_back("cli");
+    if (p.esm) tags.emplace_back("ESM");
+    if (!tags.empty()) {
+        head += " (";
+        for (std::size_t i = 0; i < tags.size(); ++i) head += (i ? ", " : "") + tags[i];
+        head += ")";
     }
-    if (!p.main.empty()) add("entry", "entry: " + p.main);
 
-    std::vector<std::pair<std::string_view, LangTally>> langs(t.langs.begin(), t.langs.end());
-    std::sort(langs.begin(), langs.end(), [](const auto& a, const auto& b) { return a.second.lines > b.second.lines; });
-    std::string langLine = "langs:";
-    for (const auto& [name, tally] : langs) langLine += " " + std::string(name) + " " + std::to_string(tally.files) + "f/" + std::to_string(tally.lines) + "L,";
-    if (!langs.empty()) langLine.pop_back();
-    add("langs", langLine);
-
-    std::vector<const FileReport*> byLines;
-    for (const auto& r : t.reports) byLines.push_back(&r);
-    std::sort(byLines.begin(), byLines.end(), [](const auto* a, const auto* b) { return a->lines > b->lines; });
-    std::string big = "big:";
-    for (std::size_t i = 0; i < byLines.size() && i < 8; ++i) big += " " + byLines[i]->rel + "(" + std::to_string(byLines[i]->lines) + ")";
-    add("big", big);
-
-    std::vector<std::pair<const FileReport*, const FnRecord*>> longFns;
-    for (const auto& r : t.reports)
-        for (const auto& f : r.fns) longFns.emplace_back(&r, &f);
-    std::sort(longFns.begin(), longFns.end(), [](const auto& a, const auto& b) { return a.second->length > b.second->length; });
-    if (!longFns.empty()) {
-        std::string longLine = "longfn(>=" + std::to_string(kLongFn) + "):";
-        for (std::size_t i = 0; i < longFns.size() && i < 12; ++i) {
-            const auto& [r, f] = longFns[i];
-            longLine += " " + r->rel + ":" + std::to_string(f->line) + " " + f->name + "(" + std::to_string(f->length) + ")";
+    std::size_t codeLines = 0;
+    for (const auto& [name, tally] : t.langs) codeLines += tally.lines;
+    const auto share = [&](std::initializer_list<std::string_view> names) {
+        std::size_t n = 0;
+        for (const auto& nm : names) {
+            if (const auto it = t.langs.find(nm); it != t.langs.end()) n += it->second.lines;
         }
-        add("longfn", longLine);
-    }
-
-    std::vector<const FileReport*> branchy = byLines;
-    std::sort(branchy.begin(), branchy.end(), [](const auto* a, const auto* b) { return a->complexity > b->complexity; });
-    std::string branchLine = "branchy:";
-    for (std::size_t i = 0; i < branchy.size() && i < 8 && branchy[i]->complexity > 0; ++i) {
-        branchLine += " " + branchy[i]->rel + "(" + std::to_string(branchy[i]->complexity) + ")";
-    }
-    add("branchy", branchLine);
-
-    add("functions", "functions: " + std::to_string(t.functions));
+        return codeLines == 0 ? std::size_t{0} : n * 100 / codeLines;
+    };
+    const std::string stats = std::to_string(t.files) + " files · " + std::to_string(t.lines) + " lines · " +
+                              std::to_string(t.functions) + " fn · JS " + std::to_string(share({"javascript", "typescript"})) +
+                              "% · Py " + std::to_string(share({"python"})) + "%";
 
     std::vector<std::string> entries;
     if (!p.main.empty()) entries.push_back(p.main);
@@ -1150,34 +1177,24 @@ std::string render(const Totals& t, const Project& p, const std::string& root, s
         if (r.lang == "json" || std::find(entries.begin(), entries.end(), r.rel) != entries.end() || t.inDegree.contains(r.rel)) continue;
         unimported.push_back(r.rel);
     }
-    add("graph", "graph: edges=" + std::to_string(t.edges) + " unresolved=" + std::to_string(t.unresolved) +
-                     " unimported=" + std::to_string(unimported.size()) + " cycles=" + std::to_string(t.cycles.size()));
+
+    const std::string arch = archTree(t, entries);
+    for (std::size_t pos = 0; pos < arch.size();) {
+        std::size_t e = arch.find('\n', pos);
+        if (e == npos) e = arch.size();
+        add(kArch, "arch", arch.substr(pos, e - pos));
+        pos = e + 1;
+    }
+
     for (std::size_t i = 0; i < t.cycles.size() && i < 8; ++i) {
         std::string line = "cycle " + std::to_string(t.cycles[i].size()) + ":";
         for (std::size_t k = 0; k < t.cycles[i].size() && k < 6; ++k) line += " " + t.cycles[i][k];
-        add("cycles", line);
-    }
-    const std::string arch = archTree(t, entries);
-    add("arch", arch.empty() ? "" : "arch:\n" + arch);
-    if (!unimported.empty()) {
-        std::string line = "unimported:";
-        for (std::size_t i = 0; i < unimported.size() && i < 12; ++i) line += " " + unimported[i];
-        add("unimported", line);
+        add(kIssues, "cycles", line);
     }
     if (!t.unresolvedSample.empty()) {
         std::string line = "unresolved:";
         for (const auto& u : t.unresolvedSample) line += " [" + u + "]";
-        add("unresolved", line);
-    }
-    std::map<std::string, std::size_t> builtins;
-    std::map<std::string, std::size_t> externals;
-    for (const auto& [name, count] : t.imports) (isBuiltin(name) ? builtins : externals).emplace(name, count);
-    if (!builtins.empty()) add("builtins", "builtins: " + joinCounted(builtins, 40));
-    if (!externals.empty()) add("deps", "deps: " + joinCounted(externals, 40));
-    if (t.functions > 0) {
-        const std::size_t tenths = (t.branches * 10 + t.functions / 2) / t.functions;
-        add("cx", "cx: " + std::to_string(tenths / 10) + "." + std::to_string(tenths % 10) + " (branches " + std::to_string(t.branches) +
-                      " / functions " + std::to_string(t.functions) + ")");
+        add(kIssues, "unresolved", line);
     }
     std::map<std::size_t, std::vector<std::pair<std::string, std::string>>> shapeGroups;
     for (const auto& r : t.reports) {
@@ -1198,8 +1215,9 @@ std::string render(const Totals& t, const Project& p, const std::string& root, s
             for (const auto& f : files) fileList += (fileList.empty() ? "" : ", ") + f;
             line += (i ? " |" : "") + std::string(" ") + group.front().first + "×" + std::to_string(group.size()) + " (" + fileList + ")";
         }
-        add("duplicates", line);
+        add(kIssues, "duplicates", line);
     }
+
     std::vector<std::string> unusedLines;
     for (const auto& r : t.reports) {
         if (std::find(entries.begin(), entries.end(), r.rel) != entries.end()) continue;
@@ -1213,22 +1231,89 @@ std::string render(const Totals& t, const Project& p, const std::string& root, s
     if (!unusedLines.empty()) {
         std::string line = "unused exports:";
         for (std::size_t i = 0; i < unusedLines.size() && i < 10; ++i) line += " " + unusedLines[i];
-        add("unused", line);
+        add(kDead, "unused", line);
     }
-    if (!t.envs.empty()) add("env", "env: " + joinCounted(t.envs, 40));
-    if (!t.urls.empty()) add("urls", "urls: " + joinCounted(t.urls, 15));
-    add("patterns", "patterns: async=" + std::to_string(t.asyncs) + " await=" + std::to_string(t.awaits) +
-                        " promise=" + std::to_string(t.promises) + " then/catch=" + std::to_string(t.thenCatch) +
-                        " try=" + std::to_string(t.tries) + " throw=" + std::to_string(t.throws) +
-                        " complexity=" + std::to_string(t.complexity) + " exports=" + std::to_string(t.exports));
+    if (!unimported.empty()) {
+        std::string line = "orphans:";
+        for (std::size_t i = 0; i < unimported.size() && i < 12; ++i) line += " " + unimported[i];
+        add(kDead, "orphans", line);
+    }
 
-    std::string out;
-    for (const auto& s : sections) out += s + "\n";
+    std::map<std::string, std::size_t> builtins;
+    std::map<std::string, std::size_t> externals;
+    for (const auto& [name, count] : t.imports) (isBuiltin(name) ? builtins : externals).emplace(name, count);
+    if (!builtins.empty()) add(kDeps, "builtins", "builtins: " + joinCounted(builtins, 40));
+    if (!externals.empty()) add(kDeps, "external", "external: " + joinCounted(externals, 40));
+    std::string unusedDeps;
+    for (const auto& d : p.deps) {
+        if (!t.imports.contains(d)) unusedDeps += (unusedDeps.empty() ? "" : ", ") + d;
+    }
+    if (!unusedDeps.empty()) add(kDeps, "unused deps", "unused deps: " + unusedDeps);
+
+    if (!t.envs.empty()) add(kIo, "env", "env: " + joinCounted(t.envs, 40));
+    if (!t.urls.empty()) add(kIo, "urls", "urls: " + joinCounted(t.urls, 15));
+    if (t.sql > 0) add(kIo, "storage", "storage: sql×" + std::to_string(t.sql));
+    for (const auto& c : t.calls) add(kCalls, "calls", c);
+
+    std::vector<std::pair<std::string_view, LangTally>> langs(t.langs.begin(), t.langs.end());
+    std::sort(langs.begin(), langs.end(), [](const auto& a, const auto& b) { return a.second.lines > b.second.lines; });
+    std::string langLine = "langs:";
+    for (const auto& [name, tally] : langs) langLine += " " + std::string(name) + " " + std::to_string(tally.files) + "f/" + std::to_string(tally.lines) + "L,";
+    if (!langs.empty()) langLine.pop_back();
+    add(kMetrics, "langs", langLine);
+
+    std::vector<const FileReport*> byLines;
+    for (const auto& r : t.reports) byLines.push_back(&r);
+    std::sort(byLines.begin(), byLines.end(), [](const auto* a, const auto* b) { return a->lines > b->lines; });
+    std::string big = "big:";
+    for (std::size_t i = 0; i < byLines.size() && i < 8; ++i) big += " " + byLines[i]->rel + "(" + std::to_string(byLines[i]->lines) + ")";
+    add(kMetrics, "big", big);
+
+    std::vector<std::pair<const FileReport*, const FnRecord*>> longFns;
+    for (const auto& r : t.reports)
+        for (const auto& f : r.fns) longFns.emplace_back(&r, &f);
+    std::sort(longFns.begin(), longFns.end(), [](const auto& a, const auto& b) { return a.second->length > b.second->length; });
+    if (!longFns.empty()) {
+        std::string longLine = "longfn(>=" + std::to_string(kLongFn) + "):";
+        for (std::size_t i = 0; i < longFns.size() && i < 12; ++i) {
+            const auto& [r, f] = longFns[i];
+            longLine += " " + r->rel + ":" + std::to_string(f->line) + " " + f->name + "(" + std::to_string(f->length) + ")";
+        }
+        add(kMetrics, "longfn", longLine);
+    }
+
+    std::vector<const FileReport*> branchy = byLines;
+    std::sort(branchy.begin(), branchy.end(), [](const auto* a, const auto* b) { return a->complexity > b->complexity; });
+    std::string branchLine = "branchy:";
+    for (std::size_t i = 0; i < branchy.size() && i < 8 && branchy[i]->complexity > 0; ++i) {
+        branchLine += " " + branchy[i]->rel + "(" + std::to_string(branchy[i]->complexity) + ")";
+    }
+    add(kMetrics, "branchy", branchLine);
+    add(kMetrics, "functions", "functions: " + std::to_string(t.functions));
+    add(kMetrics, "graph", "graph: edges=" + std::to_string(t.edges) + " unresolved=" + std::to_string(t.unresolved) +
+                              " unimported=" + std::to_string(unimported.size()) + " cycles=" + std::to_string(t.cycles.size()));
+    if (t.functions > 0) {
+        const std::size_t tenths = (t.branches * 10 + t.functions / 2) / t.functions;
+        add(kMetrics, "cx", "cx: " + std::to_string(tenths / 10) + "." + std::to_string(tenths % 10) + " (branches " + std::to_string(t.branches) +
+                                " / functions " + std::to_string(t.functions) + ")");
+    }
+    add(kMetrics, "patterns", "patterns: async=" + std::to_string(t.asyncs) + " await=" + std::to_string(t.awaits) +
+                                  " promise=" + std::to_string(t.promises) + " then/catch=" + std::to_string(t.thenCatch) +
+                                  " try=" + std::to_string(t.tries) + " throw=" + std::to_string(t.throws) +
+                                  " complexity=" + std::to_string(t.complexity) + " exports=" + std::to_string(t.exports));
+
+    std::string out = head + "\n" + stats + "\n";
+    for (std::size_t s = 0; s < kSecCount; ++s) {
+        if (sections[s].empty()) continue;
+        out += "## " + std::string(kTitles[s]) + "\n";
+        for (const auto& line : sections[s]) out += line + "\n";
+    }
     if (!dropped.empty()) {
         out += "dropped (budget):";
         for (const auto& d : dropped) out += " " + d;
         out += "\n";
     }
+    out += "legend: ## = section, ×N = occurrences, (n) = lines, complexity or length\n";
     return out;
 }
 
@@ -1265,6 +1350,7 @@ int main(int argc, char** argv) {
     }
     Totals totals = walk(root);
     buildGraph(totals, root);
+    buildCalls(totals);
     findCycles(totals);
     const Project project = readProject(root);
     std::cout << render(totals, project, root.string(), budgetTokens * 4);
