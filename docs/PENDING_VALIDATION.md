@@ -20,7 +20,7 @@ Owner: lanmower. Remote: none. Push is blocked on an owner-provided remote; noth
 
 | Step | Wall time | Result |
 |---|---|---|
-| Clean configure and build, static, with size gate | 7288 ms (measured as 7288 ms in the run) | -- size gate: 1686408 bytes within 2097152 |
+| Clean configure and build, static, with size gate | 7288 ms | -- size gate: 1686408 bytes within 2097152 |
 | witness, ignore witness, parity, file | 195 ms | RESULT pass=14 fail=0
 RESULT pass=1 fail=0
 RESULT pass=18 fail=0 (fail = open parity gaps)
